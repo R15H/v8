@@ -162,6 +162,32 @@ heap), an attacker can:
 3. Element kind, instance type, instance size are all under attacker control
 4. This enables arbitrary element kind transitions, size changes, etc.
 
+## Model Pattern: TrustedCast (Correct Approach)
+
+A few runtime functions use `TrustedCast<T>()` instead of raw `Cast<T>()`,
+demonstrating a more secure pattern. 10 instances exist across runtime code:
+
+**`runtime-regexp.cc:360-361`** (with explanatory comment):
+```cpp
+// capture_count > 0 implies IrRegExpData. Since capture_count is in
+// trusted space, this is not a SBXCHECK.
+Tagged<IrRegExpData> re_data = TrustedCast<IrRegExpData>(*regexp_data);
+```
+
+**`runtime-compiler.cc:178`**:
+```cpp
+TrustedCast<BytecodeArray>(args[2])
+```
+
+The `TrustedCast` pattern:
+1. Asserts the object is in trusted space (outside sandbox)
+2. Validates the object's Map pointer is consistent
+3. Is semantically clearer about trust boundaries
+
+This should be the model for hardening other runtime functions — but it only
+works for objects in trusted space. Objects in the regular sandbox heap still
+need explicit SBXCHECK validation after casting.
+
 ## Evidence of Known Gaps
 
 ### Recent Hardening Commit
