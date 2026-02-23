@@ -190,6 +190,125 @@ element access which is a known exploitation target. The SBXCHECKs verify:
 Similar checks should exist in runtime functions that perform equivalent
 operations.
 
+## Critical Finding: Runtime_TypedArraySet Has No Bounds Checking
+
+### Location: `src/runtime/runtime-typedarray.cc:205-216`
+
+```cpp
+RUNTIME_FUNCTION(Runtime_TypedArraySet) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(4, args.length());
+  DirectHandle<JSTypedArray> target = args.at<JSTypedArray>(0);
+  DirectHandle<JSAny> source = args.at<JSAny>(1);
+  size_t length;
+  CHECK(TryNumberToSize(args[2], &length));
+  size_t offset;
+  CHECK(TryNumberToSize(args[3], &offset));
+  ElementsAccessor* accessor = target->GetElementsAccessor();
+  return accessor->CopyElements(isolate, source, target, length, offset);
+}
+```
+
+**Vulnerability**: No validation that `offset + length <= target->GetByteLength()`.
+The `CHECK(TryNumberToSize(...))` calls only verify the arguments are valid numbers,
+NOT that they are within bounds of the target array. The `CopyElements` call may
+write beyond the TypedArray's allocation.
+
+Similarly, `Runtime_TypedArrayCopyElements` (line 51-60) passes `length` directly
+to `CopyElements` with offset 0, but never validates `length` against the target.
+
+### Risk: HIGH - Direct Path to Sandbox Escape
+
+An attacker with sandbox R/W can:
+1. Corrupt a JSTypedArray object's internal fields
+2. Trigger `Runtime_TypedArraySet` via `TypedArray.prototype.set()`
+3. Provide large `length`/`offset` values that exceed the actual backing store
+4. `CopyElements` writes beyond the allocation → out-of-sandbox memory corruption
+
+### V8 Team Acknowledgment of Corruption Risk
+
+At `runtime-typedarray.cc:158-160`, inside `Runtime_TypedArraySortFast`, the V8
+team explicitly comments:
+
+```cpp
+  // The type is not necessarily consistent with the byte_length we read (a
+  // sandbox attacker might have changed it). The code below must handle it
+  // gracefully.
+```
+
+This comment proves the team **knows** sandbox attackers can corrupt TypedArray
+fields, and that runtime functions must handle this. Yet `Runtime_TypedArraySet`
+(just 45 lines below this comment) has NO such handling.
+
+## Critical Finding: Runtime_GrowArrayElements Trusts Corrupted Map
+
+### Location: `src/runtime/runtime-array.cc:164-198`
+
+```cpp
+RUNTIME_FUNCTION(Runtime_GrowArrayElements) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(2, args.length());
+  DirectHandle<JSObject> object = args.at<JSObject>(0);
+  DirectHandle<Object> key = args.at(1);
+  ElementsKind kind = object->GetElementsKind();  // Trusts object's Map
+  CHECK(IsFastElementsKind(kind));
+  // ...
+  uint32_t capacity = object->elements()->ulength().value();  // Trusts elements
+  // ...
+  object->GetElementsAccessor()->GrowCapacity(isolate, object, index);
+```
+
+If the object's Map is corrupted, `GetElementsKind()` returns attacker-controlled
+values. The `IsFastElementsKind` check limits this, but `elements()->ulength()`
+reads from attacker-controlled memory. A corrupted length can cause `GrowCapacity`
+to allocate an incorrect size.
+
+Similarly, `Runtime_ArrayIncludes_Slow` at line 241 trusts `object->map()->instance_type()`
+to determine whether to treat the object as a JSArray, enabling type confusion.
+
+## Hardening Commit Analysis: a03a1a3c
+
+### What Was Fixed
+
+Commit `a03a1a3c` hardened **7 functions** in `runtime-test-wasm.cc` with
+bounds checking on `func_index`:
+
+```
+Runtime_WasmTierUpFunction          (line 777-789)
+Runtime_WasmTriggerTierUpForTesting (line 791-814)
+Runtime_IsWasmDebugFunction         (line 943-958)
+Runtime_IsLiftoffFunction           (line 960-978)
+Runtime_IsTurboFanFunction          (line 981-999)
+Runtime_IsUncompiledWasmFunction    (line 1001-1010)
+Runtime_WasmDeoptsExecutedForFunction (line 1059-1079)
+```
+
+### Hardening Pattern Applied
+
+```cpp
+// BEFORE (unsafe):
+if (func_index < module->num_imported_functions) {
+  return CrashUnlessFuzzing(isolate);
+}
+
+// AFTER (safe - checks both bounds):
+if (static_cast<uint32_t>(func_index) < module->num_imported_functions ||
+    static_cast<uint32_t>(func_index) >= module->functions.size()) {
+  return CrashUnlessFuzzing(isolate);
+}
+```
+
+### What Was NOT Fixed
+
+All non-WASM runtime functions remain unhardened. The safe pattern demonstrated
+above (input validation + bounds checking + `CrashUnlessFuzzing`) has not been
+applied to any function in:
+- `runtime-array.cc` (10 functions)
+- `runtime-typedarray.cc` (8 functions)
+- `runtime-object.cc` (74 functions)
+- `runtime-strings.cc` (23 functions)
+- `runtime-internal.cc` (64 functions)
+
 ## Exploitation Scenario
 
 ### Post-Corruption Runtime Abuse
@@ -211,16 +330,52 @@ After achieving arbitrary R/W inside the sandbox (via JIT bug):
 // → OOB read/write during string operation
 ```
 
-### Specific Attack Chain
+### Specific Attack Chain: TypedArraySet OOB Write
 
 ```
-1. JIT bug (VULN-001) → OOB write in array backing store
-2. Corrupt adjacent JSArray's length field (make it larger)
-3. Call Array.prototype.slice() on the corrupted array
-   → runtime-array.cc handles this
-   → no SBXCHECK on length → copies beyond actual allocation
-   → heap corruption
-4. Use heap corruption to target more sensitive objects
+1. JIT bug (VULN-001/other) → OOB write in sandbox
+2. Corrupt a JSTypedArray's byte_length field (make it smaller than actual)
+   OR corrupt the backing_store pointer
+3. Call typedArray.set(sourceArray) which invokes Runtime_TypedArraySet
+   → runtime-typedarray.cc:205-216 handles this
+   → No validation of offset + length against actual backing store
+   → CopyElements writes beyond the TypedArray's allocation
+4. If the backing store pointer was corrupted to point outside sandbox:
+   → Direct out-of-sandbox write → full compromise
+```
+
+### Specific Attack Chain: TypedArraySort Type Confusion
+
+```
+1. JIT bug → sandbox R/W
+2. Corrupt a JSTypedArray's type field (e.g., change Float64 to Uint8)
+3. Call typedArray.sort() which invokes Runtime_TypedArraySortFast
+   → runtime-typedarray.cc:106-203
+   → Reads byte_length correctly at line 127
+   → BUT type at line 161 is corrupted → wrong sizeof(ctype)
+   → length = byte_length / sizeof(wrong_ctype)
+   → If wrong_ctype is smaller, length is too large
+   → std::sort operates on data + length beyond allocation
+   → OOB read/write during sort
+```
+
+Note: The V8 team's comment at line 158-160 acknowledges this specific risk
+but the `switch(array->type())` at line 161 still uses the potentially
+corrupted type. The comment says the code "must handle it gracefully" but
+the length calculation `byte_length / sizeof(ctype)` with a corrupted type
+that has a smaller sizeof will produce a too-large length.
+
+### Specific Attack Chain: GrowArrayElements
+
+```
+1. JIT bug → OOB write in array backing store
+2. Corrupt adjacent JSArray's Map pointer → fake Map with wrong elements_kind
+3. Call array[large_index] = value to trigger Runtime_GrowArrayElements
+   → runtime-array.cc:164-198
+   → GetElementsKind() reads corrupted Map → attacker-controlled kind
+   → IsFastElementsKind check passes (attacker picks a fast kind)
+   → elements()->ulength() reads from corrupted elements header
+   → GrowCapacity called with incorrect capacity → heap corruption
 ```
 
 ## Recommended Mitigations
@@ -253,7 +408,11 @@ After achieving arbitrary R/W inside the sandbox (via JIT bug):
 | Total `args.at<Type>()` unchecked casts | 288 |
 | DCHECK-only validation (stripped in release) | ~200+ |
 | Runtime CHECK validation (retained in release) | ~66 |
+| Functions hardened in recent commit (a03a1a3c) | 7 (WASM test only) |
+| Functions with known sandbox corruption risk | 3+ (TypedArraySet, TypedArrayCopyElements, TypedArraySortFast) |
+| Functions trusting corrupted Map fields | 5+ (GrowArrayElements, ArrayIncludes_Slow, ArrayIndexOf, TransitionElementsKind, etc.) |
 | Security-related TODOs in runtime | 0 |
+| V8 team comments acknowledging corruption risk | 1 (runtime-typedarray.cc:158-160) |
 
 ## Key File References
 

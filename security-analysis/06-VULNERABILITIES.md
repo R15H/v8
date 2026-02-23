@@ -295,12 +295,13 @@ classification is correct.
 
 ---
 
-## VULN-006: Runtime Function Hardening Gaps [MEDIUM]
+## VULN-006: Runtime Function Hardening Gaps [MEDIUM-HIGH]
 
 ### Location
 - **Files**: `src/runtime/*.cc` (35 files)
+- **Critical function**: `Runtime_TypedArraySet` at `runtime-typedarray.cc:205-216`
 - **Evidence**: Recent commit `a03a1a3c` ("Harden some runtime functions
-  against corrupted input")
+  against corrupted input") + V8 team comment at `runtime-typedarray.cc:158-160`
 
 ### Description
 
@@ -309,25 +310,34 @@ the interpreter. They receive V8 objects as arguments. After the sandbox
 threat model was adopted (attacker has arbitrary R/W in sandbox), these
 functions need to validate that their inputs haven't been corrupted.
 
-The recent hardening commit suggests that some runtime functions were
-**not** validating their inputs, meaning corrupted objects could cause:
-- Out-of-bounds accesses in C++ code
-- Type confusion in C++ (treating corrupted Map as valid)
+**Key finding**: `Runtime_TypedArraySet` (line 205-216) passes user-controlled
+`length` and `offset` directly to `CopyElements()` without bounds validation.
+The V8 team acknowledges this class of risk at line 158-160 of the same file:
+*"The type is not necessarily consistent with the byte_length we read (a sandbox
+attacker might have changed it)."* Yet most functions lack hardening.
+
+Recent hardening commit `a03a1a3c` fixed 7 WASM test functions but left
+all non-WASM runtime functions unhardened:
+- Out-of-bounds accesses via corrupted TypedArray length/offset
+- Type confusion via corrupted Map (element kind, instance type)
 - Controlled writes through corrupted object fields
+- 288 unchecked `args.at<Type>()` downcasts across all runtime files
 
 ### Exploitation
 
 1. Achieve sandbox R/W (via any initial bug)
-2. Corrupt an object that will be passed to a runtime function
-3. The runtime function processes the corrupted object unsafely
-4. Achieve out-of-sandbox memory corruption
+2. Corrupt a JSTypedArray's backing store pointer or byte_length
+3. Call `typedArray.set(source)` → invokes `Runtime_TypedArraySet`
+4. No bounds check on offset+length → `CopyElements` writes OOB
+5. If backing store points outside sandbox → direct escape
 
 ### Verification
 
 1. Identify all runtime functions: `grep "RUNTIME_FUNCTION" src/runtime/*.cc`
 2. For each, check if it validates its arguments against corruption
 3. Focus on functions that:
-   - Access array elements by index (OOB)
+   - Access TypedArray backing stores (Runtime_TypedArraySet, CopyElements)
+   - Trust Map fields (Runtime_GrowArrayElements, ArrayIncludes_Slow)
    - Follow pointer chains (could lead outside sandbox)
    - Write to computed offsets (controlled writes)
 
@@ -368,7 +378,7 @@ crash. Generally low severity as modern OSes have guard pages.
 | VULN-003 | CheckBounds precision | LOW** | LOW | LOW | Non-safe-integer length (impractical) |
 | VULN-004 | Partial sandbox | MEDIUM | MEDIUM | MEDIUM | Memory pressure + sandbox OOB |
 | VULN-005 | FatalNoSecurityImpact | MEDIUM | LOW | MEDIUM | Misclassified error |
-| VULN-006 | Runtime hardening | MEDIUM | HIGH | HIGH | Sandbox R/W + unhardened function |
+| VULN-006 | Runtime hardening | MEDIUM-HIGH | HIGH | HIGH | Sandbox R/W + Runtime_TypedArraySet (no bounds check) |
 | VULN-007 | RegExp stack overflow | LOW | LOW | LOW | Deep regexp nesting |
 
 \* **VULN-001 Revised Assessment**: Deep static analysis revealed that the

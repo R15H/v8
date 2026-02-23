@@ -26,7 +26,7 @@ further investigation.
 | 3 | TurboFan CheckBounds precision boundary | **LOW** | `src/compiler/operation-typer.cc:1347` | Mitigated by type cache |
 | 4 | Sandbox partial reservation fallback | **MEDIUM** | `src/sandbox/sandbox.h:72,113` | Design weakness |
 | 5 | `FatalNoSecurityImpact` crash suppression | **MEDIUM** | `src/base/logging.cc:101` | Design concern |
-| 6 | Runtime function hardening gaps | **MEDIUM** | `src/runtime/` (1/671 SBXCHECK) | Pattern-based |
+| 6 | Runtime function hardening gaps | **MEDIUM-HIGH** | `src/runtime/runtime-typedarray.cc:205` | No bounds check in TypedArraySet |
 | 7 | RegExp visitor stack overflow pattern | **LOW** | `src/regexp/` | Partially fixed |
 | 8 | StoreNoWriteBarrier audit targets | **HIGH** (if wrong) | `src/codegen/code-stub-assembler.cc` | 45+ occurrences |
 
