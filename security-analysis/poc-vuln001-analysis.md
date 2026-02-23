@@ -53,10 +53,20 @@ typer.h:613-667:
   Multiply() - THE BUGGY FUNCTION
     → Computes result type with incorrect maybe_nan flag
     ↓
-Type stored in graph, consumed by:
+Type stored in graph, consumed by (IF --turboshaft-typed-optimizations):
   - typed-optimizations-reducer.h (constant folding, branch elimination)
   - Other downstream Turboshaft optimization passes
   - LessThan/LessThanOrEqual comparisons (typer.h:945-1011)
+
+Pipeline phase ordering (pipelines.h:201-255):
+  Phase 4: OptimizePhase (always) ← MachineOptimizationReducer
+  Phase 5: TypedOptimizationsPhase (EXPERIMENTAL, default OFF)
+    ↑ This is the only phase that uses the buggy type result
+  Phase 6: TypeAssertionsPhase (debug only)
+
+Note: The Maglev→Turboshaft transition path is:
+  turbolev-graph-builder.cc:4389  PROCESS_FLOAT64_BINOP(Multiply, Mul)
+    → assembler.h:1756  Float64Mul() emits FloatBinopOp(kMul, Float64)
 ```
 
 ## Exploitability Analysis (Revised)
@@ -95,7 +105,22 @@ With the above trigger:
 - Result type: `Range[-inf, inf, -0]` **without NaN** (incorrect)
 - Actual runtime range: includes NaN when `a=Infinity, b≈0`
 
-**Current Impact: LIMITED**
+**Current Impact: LIMITED (Multiple Mitigating Factors)**
+
+**Factor 1: TypedOptimizations phase is EXPERIMENTAL (disabled by default)**
+
+The phase that consumes the buggy type inference results is gated behind:
+```cpp
+// flag-definitions.h:1747
+DEFINE_EXPERIMENTAL_FEATURE(turboshaft_typed_optimizations, ...)
+// DEFINE_EXPERIMENTAL_FEATURE sets default=false (flag-definitions.h:245)
+```
+
+This means `--turboshaft-typed-optimizations` is **false by default**. The
+`TypedOptimizationsReducer` (which would use the incorrect NaN type to fold
+branches or constants) does NOT run unless explicitly enabled.
+
+**Factor 2: Wide result range**
 
 The result range `[-inf, inf]` is extremely wide, so:
 - **Constant folding** (`typed-optimizations-reducer.h:108-118`): Not triggered
@@ -106,21 +131,31 @@ The result range `[-inf, inf]` is extremely wide, so:
   doesn't change the outcome because `can_be_false` is already true for the
   wide range
 
+**Factor 3: Float64Equal is not typed**
+
+The `kEqual` comparison returns `{0, 1}` unconditionally (TODO at
+`typer.h:1492-1494`), so `x === x` cannot be folded to `true`.
+
 ### Future Exploitability: HIGH
 
-The bug becomes exploitable when:
+The bug becomes exploitable when ANY of these conditions change:
 
-1. **Float64Equal gets typed** (currently TODO at `typer.h:1492-1494`):
+1. **`--turboshaft-typed-optimizations` becomes default-on**:
+   The flag is marked as experimental and will likely be enabled by default
+   as Turboshaft matures. When enabled, all typed optimization reducers
+   will consume the incorrect type.
+
+2. **Float64Equal gets typed** (currently TODO at `typer.h:1492-1494`):
    If `Float64Equal(x, x)` is typed to `Constant(1)` when `!x.has_nan()`,
    then `x !== x` branch would be incorrectly eliminated, allowing NaN to
    flow into code that assumes non-NaN.
 
-2. **New optimization passes** check `has_nan()`:
+3. **New optimization passes** check `has_nan()`:
    Any future Turboshaft reducer that uses `has_nan()` to make optimization
    decisions (e.g., eliminating NaN guards, optimizing conversions) would be
    affected.
 
-3. **Cross-tier interaction**: If Turboshaft types feed into TurboFan or Maglev
+4. **Cross-tier interaction**: If Turboshaft types feed into TurboFan or Maglev
    (through OSR or shared feedback), the incorrect type could affect
    optimizations in those tiers.
 
@@ -245,21 +280,40 @@ function pwn(a, b, arr, oob_arr) {
      bool maybe_minuszero = l.has_minus_zero() || r.has_minus_zero() ||
 ```
 
-## Severity Assessment (Updated)
+## Severity Assessment (Updated with Pipeline Analysis)
 
 | Aspect | Rating |
 |--------|--------|
 | Bug Confirmed | YES - copy-paste error verified against TurboFan equivalent |
-| Current Exploitability | LOW - redundant NaN detection and wide result ranges limit impact |
-| Future Exploitability | HIGH - becomes critical when Float64Equal is typed or new passes added |
+| TypedOptimizations Phase | EXPERIMENTAL - `--turboshaft-typed-optimizations` defaults to `false` |
+| Current Exploitability | **VERY LOW** - typed opts disabled by default + redundant NaN detection + wide ranges |
+| Future Exploitability | **CRITICAL** - when typed opts default on + Float64Equal typed + new passes |
 | Ease of Fix | TRIVIAL - one character change (`r` → `l`) |
 | Similar Past CVEs | CVE-2023-2033, CVE-2023-3079, CVE-2024-0517 (type confusion in JIT) |
-| Recommended Severity | MEDIUM (latent vulnerability, will become CRITICAL with Turboshaft evolution) |
+| Recommended Severity | **LOW** currently, **CRITICAL** once `--turboshaft-typed-optimizations` is enabled by default |
+
+### Key Finding: Three Gates to Exploitability
+
+The bug requires ALL THREE of these conditions to become exploitable:
+
+1. `--turboshaft-typed-optimizations` must be enabled (currently experimental, default OFF)
+2. Float64Equal typing must be implemented (currently TODO at typer.h:1492)
+3. The specific input range pattern must be triggered (`l=[1,inf]`, `r` contains 0 interior)
+
+When ALL three conditions are met, the exploitation chain is:
+```
+Multiply(inf, 0) → NaN (but typed as non-NaN)
+  → Float64Equal(NaN, NaN) → typed as Constant(1) (should be 0)
+  → Branch(NaN !== NaN) eliminated as dead code
+  → NaN flows into "dead" code path → type confusion → OOB
+```
 
 ## Verification Steps
 
-1. Build V8 with `--trace-turbo` and `--trace-turbo-types`
+1. Build V8 with `--turboshaft-typed-optimizations --turboshaft-trace-typing`
 2. Run PoC 1 to observe the type of the multiply result
 3. Check if the type includes NaN: it should but doesn't
 4. Apply the one-character fix and verify the type now includes NaN
 5. Run V8 type system unit tests to confirm no regression
+6. Note: Without `--turboshaft-typed-optimizations`, the bug is present in the
+   type computation but has no downstream effect
