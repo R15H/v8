@@ -417,6 +417,116 @@ If LSan is accidentally enabled in production, the external pointer table
 entries contain unencoded raw pointers alongside the tagged pointers,
 completely bypassing the type tag protection.
 
+## Additional Findings (From Final Deep Investigation)
+
+### Vector 13: DisallowSandboxAccess is NOP in Release Builds
+
+**Location**: `src/sandbox/hardware-support.h:228-244`
+
+```cpp
+class V8_EXPORT_PRIVATE V8_NODISCARD V8_ALLOW_UNUSED DisallowSandboxAccess {
+ public:
+#if defined(DEBUG) && defined(V8_ENABLE_SANDBOX_HARDWARE_SUPPORT)
+  explicit DisallowSandboxAccess(const char* reason);  // Active in debug
+  ~DisallowSandboxAccess();
+  // ...
+#else
+  explicit DisallowSandboxAccess(const char* reason) {}  // NOP in release!
+#endif
+};
+```
+
+The `DisallowSandboxAccess` scope used in every `SBXCHECK` (check.h:39) is a
+**no-op in release builds** unless BOTH `DEBUG` AND `V8_ENABLE_SANDBOX_HARDWARE_SUPPORT`
+are defined. Since production Chrome is built without `DEBUG`, every SBXCHECK
+runs with full sandbox access, meaning:
+- The checked value can race with sandbox memory modifications
+- The TOCTOU prevention mechanism is **non-functional** in production
+- SBXCHECK degrades to a plain CHECK in production (no sandbox isolation)
+
+### Vector 14: CodePointerTable Freelist Tag Exploitation
+
+**Location**: `src/sandbox/code-pointer-table-inl.h:62-81`
+
+```cpp
+void CodePointerTableEntry::MakeFreelistEntry(uint32_t next_entry_index) {
+  Address value = kFreeEntryTag | next_entry_index;
+  entrypoint_.store(value, std::memory_order_relaxed);
+  code_.store(kNullAddress, std::memory_order_relaxed);
+}
+
+bool CodePointerTableEntry::IsFreelistEntry() const {
+  auto entrypoint = entrypoint_.load(std::memory_order_relaxed);
+  return (entrypoint & kFreeEntryTag) == kFreeEntryTag;
+}
+```
+
+The CPT distinguishes live entries from freelist entries using `kFreeEntryTag`.
+All `GetEntrypoint()`, `GetCodeObject()`, `SetEntrypoint()`, `SetCodeObject()`
+use `DCHECK(!IsFreelistEntry())` which is **stripped in release builds**.
+
+**Attack**: If an attacker can write `kFreeEntryTag` into a live CPT entry's
+entrypoint:
+1. `IsFreelistEntry()` returns true → entry appears free
+2. Next allocation may reuse this "freed" entry
+3. Original code still references the old handle → uses the reallocated entry
+4. **Use-after-free** on the code pointer → arbitrary code execution
+
+The CPT is write-protected, so this requires bypassing MPK first. But on
+platforms without MPK (ARM, older x86), this is directly exploitable.
+
+### Vector 15: Bytecode Verifier Missing Operand Validation
+
+**Location**: `src/sandbox/bytecode-verifier.cc:208-219`
+
+```cpp
+case interpreter::OperandType::kFlag8:
+case interpreter::OperandType::kFlag16:
+case interpreter::OperandType::kEmbeddedFeedback:
+case interpreter::OperandType::kIntrinsicId:
+case interpreter::OperandType::kNativeContextIndex:
+case interpreter::OperandType::kUImm:
+case interpreter::OperandType::kImm:
+case interpreter::OperandType::kFeedbackSlot:
+case interpreter::OperandType::kContextSlot:
+case interpreter::OperandType::kCoverageSlot:
+case interpreter::OperandType::kRegCount:
+  break;  // NO VALIDATION FOR ANY OF THESE!
+```
+
+The bytecode verifier's `VerifyFull()` performs **no validation** for:
+- `kFeedbackSlot` - can corrupt inline caches → type confusion
+- `kContextSlot` - can access arbitrary context slots → scope escape
+- `kNativeContextIndex` - can reference invalid native context entries
+- `kIntrinsicId` - can access undefined intrinsics
+
+This extends Vector 9 (runtime function blocklist). Not only are almost all
+runtime functions allowed, but feedback slots and context access are entirely
+unchecked, giving a bytecode-corruption attacker access to V8's inline cache
+and scope chain.
+
+### Vector 16: OutsideSandbox() Weakness for Partially Reserved
+
+**Location**: `src/sandbox/sandbox.h` (inferred from agent analysis)
+
+The `OutsideSandbox()` function uses `ReservationContains()` for partially
+reserved sandboxes:
+```cpp
+V8_INLINE bool OutsideSandbox(uintptr_t address) {
+  Sandbox* sandbox = Sandbox::current();
+  return !sandbox->ReservationContains(address);
+}
+```
+
+For a partially reserved sandbox where `reservation_size_ < size_`:
+- `ReservationContains()` checks `[reservation_base_, reservation_base_ + reservation_size_)`
+- Gap region addresses `[base_ + reservation_size_, base_ + size_)` are NOT
+  in the reservation
+- These gap addresses pass `OutsideSandbox()` → treated as trusted
+- But they ARE within the sandbox's virtual range
+- An attacker can place corrupted pointers in the gap region that pass
+  trusted pointer validation
+
 ## Recommended Mitigations
 
 1. **Remove `kFallbackToPartiallyReservedSandboxAllowed`**: Crash instead of
@@ -454,4 +564,7 @@ completely bypassing the type tag protection.
 | `sandbox/bytecode-verifier.cc` | 31-82 | `VerifyLight()` (jump targets only) |
 | `sandbox/hardware-support.h` | 16-80 | MPK-based hardware protection |
 | `sandbox/testing.h` | 80-86 | Memory Corruption API |
+| `sandbox/hardware-support.h` | 228-244 | **DisallowSandboxAccess NOP in release** |
+| `sandbox/code-pointer-table-inl.h` | 62-81 | **Freelist tag exploitation (CPT)** |
+| `sandbox/bytecode-verifier.cc` | 208-219 | **Missing operand validation (11 types)** |
 | `sandbox/GLOSSARY.md` | 106-107 | EPT swap attack documentation |
