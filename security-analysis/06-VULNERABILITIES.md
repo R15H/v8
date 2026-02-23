@@ -359,14 +359,58 @@ crash. Generally low severity as modern OSes have guard pages.
 
 ---
 
-## Summary Table
+## Summary Table (Revised After Deep Dive Analysis)
 
-| ID | Title | Severity | Exploitability | Requires |
-|----|-------|----------|----------------|----------|
-| VULN-001 | Turboshaft Multiply NaN | CRITICAL | High | Turboshaft compilation path |
-| VULN-002 | allow_invalid_inputs | HIGH | Medium | Turboshaft + secondary bug |
-| VULN-003 | CheckBounds precision | MEDIUM | Low | Non-safe-integer length |
-| VULN-004 | Partial sandbox | MEDIUM | Medium | Memory pressure + sandbox OOB |
-| VULN-005 | FatalNoSecurityImpact | MEDIUM | Low | Misclassified error |
-| VULN-006 | Runtime hardening | MEDIUM | High | Sandbox R/W + unhardened function |
-| VULN-007 | RegExp stack overflow | LOW | Low | Deep regexp nesting |
+| ID | Title | Severity | Current Exploitability | Future Exploitability | Requires |
+|----|-------|----------|----------------------|----------------------|----------|
+| VULN-001 | Turboshaft Multiply NaN | MEDIUM* | LOW | CRITICAL | Float64Equal typing + Turboshaft path |
+| VULN-002 | allow_invalid_inputs | HIGH | MEDIUM | HIGH | Turboshaft + secondary bug |
+| VULN-003 | CheckBounds precision | LOW** | LOW | LOW | Non-safe-integer length (impractical) |
+| VULN-004 | Partial sandbox | MEDIUM | MEDIUM | MEDIUM | Memory pressure + sandbox OOB |
+| VULN-005 | FatalNoSecurityImpact | MEDIUM | LOW | MEDIUM | Misclassified error |
+| VULN-006 | Runtime hardening | MEDIUM | HIGH | HIGH | Sandbox R/W + unhardened function |
+| VULN-007 | RegExp stack overflow | LOW | LOW | LOW | Deep regexp nesting |
+
+\* **VULN-001 Revised Assessment**: Deep static analysis revealed that the
+Multiply function has three independent NaN detection mechanisms. The buggy
+`maybe_nan` flag (line 620) is only relevant when the range path is taken AND
+endpoint products don't produce NaN AND interior values do. This limits
+current impact, but becomes CRITICAL when Float64Equal typing is implemented
+(TODO at `typer.h:1492`). See `poc-vuln001-analysis.md` for full analysis.
+
+\*\* **VULN-003 Revised Assessment**: The type cache constrains all array
+length types to well within safe integer range. `kFixedArrayLengthType` is
+capped at `FixedArray::kMaxLength` (< 2^30), and `kJSArrayLengthType` is
+`Type::Unsigned32()`. Precision loss in `CheckBounds` is not practically
+exploitable, though the DCHECK-only guard remains a defense-in-depth concern.
+See `deep-dive-vuln003-checkbounds-precision.md` for full analysis.
+
+### Additional Finding: StoreNoWriteBarrier Audit Target
+
+Deep analysis revealed **45 StoreNoWriteBarrier** occurrences in
+`code-stub-assembler.cc` and **3+ UnsafeStoreNoWriteBarrier** calls that
+warrant security audit. Missing write barriers are historically one of the
+most exploitable V8 vulnerability classes (UAF → type confusion → OOB).
+See `deep-dive-vuln005-007-additional-patterns.md`.
+
+### Additional Finding: Runtime SBXCHECK Gap
+
+Only **1 SBXCHECK** exists across all 32 runtime files containing **671
+RUNTIME_FUNCTION** definitions. This represents a major gap in sandbox
+hardening for post-corruption exploitation. See `deep-dive-vuln006-runtime-hardening.md`.
+
+---
+
+## Deep Dive Documents
+
+For thorough analysis of each vulnerability area, see the companion deep-dive
+documents:
+
+| Document | Coverage |
+|----------|----------|
+| `poc-vuln001-analysis.md` | VULN-001 PoC, call chain, exploitation analysis |
+| `deep-dive-vuln002-allow-invalid-inputs.md` | VULN-002 InputIs() call sites, unimplemented ops |
+| `deep-dive-vuln003-checkbounds-precision.md` | VULN-003 bounds check elimination chain |
+| `deep-dive-vuln004-sandbox-bypass.md` | VULN-004 pointer tables, hardware support, bypass vectors |
+| `deep-dive-vuln005-007-additional-patterns.md` | VULN-005/007 + write barriers + concurrent marking |
+| `deep-dive-vuln006-runtime-hardening.md` | VULN-006 SBXCHECK coverage gap analysis |

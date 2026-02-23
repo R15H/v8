@@ -17,17 +17,18 @@ sandbox architecture. The analysis identified **1 confirmed bug** (potential
 CVE) in the Turboshaft compiler and **6+ vulnerability patterns** warranting
 further investigation.
 
-## Findings Summary
+## Findings Summary (Revised After Deep Dive)
 
 | # | Finding | Severity | File | Status |
 |---|---------|----------|------|--------|
-| 1 | Turboshaft Multiply NaN Type Confusion | **CRITICAL** | `src/compiler/turboshaft/typer.h:620` | Confirmed bug |
+| 1 | Turboshaft Multiply NaN Type Confusion | **MEDIUM** (latent **CRITICAL**) | `src/compiler/turboshaft/typer.h:620` | Confirmed bug |
 | 2 | Turboshaft `allow_invalid_inputs()` always true | **HIGH** | `src/compiler/turboshaft/typer.h:1619` | Design weakness |
-| 3 | TurboFan CheckBounds precision boundary | **MEDIUM** | `src/compiler/operation-typer.cc:1347` | Theoretical |
+| 3 | TurboFan CheckBounds precision boundary | **LOW** | `src/compiler/operation-typer.cc:1347` | Mitigated by type cache |
 | 4 | Sandbox partial reservation fallback | **MEDIUM** | `src/sandbox/sandbox.h:72,113` | Design weakness |
 | 5 | `FatalNoSecurityImpact` crash suppression | **MEDIUM** | `src/base/logging.cc:101` | Design concern |
-| 6 | Runtime function hardening gaps | **MEDIUM** | `src/runtime/` | Pattern-based |
+| 6 | Runtime function hardening gaps | **MEDIUM** | `src/runtime/` (1/671 SBXCHECK) | Pattern-based |
 | 7 | RegExp visitor stack overflow pattern | **LOW** | `src/regexp/` | Partially fixed |
+| 8 | StoreNoWriteBarrier audit targets | **HIGH** (if wrong) | `src/codegen/code-stub-assembler.cc` | 45+ occurrences |
 
 ## Attack Surface Priority Matrix
 
@@ -80,6 +81,12 @@ LOW ─────────────────────────�
 | [05-SANDBOX-ANALYSIS.md](05-SANDBOX-ANALYSIS.md) | Sandbox architecture, pointer tables, bypass vectors |
 | [06-VULNERABILITIES.md](06-VULNERABILITIES.md) | Specific bugs found with exploitation strategies |
 | [07-FILE-REFERENCE.md](07-FILE-REFERENCE.md) | Quick-reference index of security-critical files |
+| [poc-vuln001-analysis.md](poc-vuln001-analysis.md) | VULN-001 complete call chain, PoC, and exploitation analysis |
+| [deep-dive-vuln002-allow-invalid-inputs.md](deep-dive-vuln002-allow-invalid-inputs.md) | VULN-002: 40+ InputIs() call sites, 30+ unimplemented ops |
+| [deep-dive-vuln003-checkbounds-precision.md](deep-dive-vuln003-checkbounds-precision.md) | VULN-003: Bounds check elimination chain analysis |
+| [deep-dive-vuln004-sandbox-bypass.md](deep-dive-vuln004-sandbox-bypass.md) | VULN-004: 8 sandbox bypass vectors with pointer table analysis |
+| [deep-dive-vuln005-007-additional-patterns.md](deep-dive-vuln005-007-additional-patterns.md) | VULN-005/007: FatalNoSecurityImpact + write barriers + RegExp |
+| [deep-dive-vuln006-runtime-hardening.md](deep-dive-vuln006-runtime-hardening.md) | VULN-006: Runtime SBXCHECK coverage gap (1/671 functions) |
 
 ## Methodology
 
