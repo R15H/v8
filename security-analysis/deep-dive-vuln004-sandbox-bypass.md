@@ -527,6 +527,146 @@ For a partially reserved sandbox where `reservation_size_ < size_`:
 - An attacker can place corrupted pointers in the gap region that pass
   trusted pointer validation
 
+### Vector 17: Freelist Allocation TOCTOU Race (ABA Attack)
+
+**Location**: `src/sandbox/external-entity-table-inl.h:259-288`
+
+```cpp
+template <typename Entry, size_t size>
+uint32_t ExternalEntityTable<Entry, size>::
+    TryAllocateEntryFromFreelist(Space* space) {
+  FreelistHead freelist = space->freelist_head_.load(std::memory_order_relaxed);
+  // ...
+  Entry& freelist_entry = this->at(freelist.next());
+  auto maybe_next_freelist_entry = freelist_entry.GetNextFreelistEntryIndex();
+  uint32_t next_freelist_entry = maybe_next_freelist_entry.value_or(0);
+  FreelistHead new_freelist(next_freelist_entry, freelist.length() - 1);
+  bool success = space->freelist_head_.compare_exchange_strong(
+      freelist, new_freelist);
+  CHECK_IMPLIES(success, maybe_next_freelist_entry.has_value());
+}
+```
+
+**Attack**: Classic ABA problem on the freelist CAS loop:
+1. Thread reads `freelist_entry` at index N, sees next = M
+2. Attacker (or concurrent thread) allocates entry N, frees it again
+3. Entry N now has a different `next` value but the CAS still succeeds
+   because the freelist head hasn't changed
+4. Result: freelist corruption → double allocation or use-after-free
+
+The comments at lines 264-272 acknowledge this race window. The CHECK at
+line 285 only catches the case where a non-freelist entry was read, but
+cannot detect ABA corruption.
+
+**Severity**: HIGH (requires concurrency, but leads to entry corruption)
+
+### Vector 18: Trusted Pointer Re-Publishing Attack
+
+**Location**: `src/sandbox/trusted-pointer-table-inl.h:139-150`
+
+The `TrustedPointerTable` allows entries to be "unpublished" via
+`kUnpublishedIndirectPointerTag` (line 58 in trusted-pointer-table.h), making
+them temporarily inaccessible. When re-published, the tag can potentially be
+changed, altering the perceived type of the referenced object.
+
+```
+1. Entry allocated with tag_A → points to ObjectA
+2. Entry unpublished (tag = kUnpublishedIndirectPointerTag)
+3. Entry re-published with tag_B → same pointer, different type
+4. Code reading through tag_B sees ObjectA with wrong type → type confusion
+```
+
+**Severity**: MEDIUM (requires ability to manipulate table entries)
+
+### Vector 19: Entry Evacuation/Compaction Race
+
+**Location**: `src/sandbox/external-pointer-table.h:230-235`
+
+During GC compaction, pointer table entries are evacuated (moved) between
+table segments. Three evacuation marking modes exist:
+
+```cpp
+enum class EvacuateMarkMode {
+  kTransferMark,    // Transfer marking bit
+  kLeaveUnmarked,   // Don't mark the new entry
+  kClearMark,       // Clear the mark on the new entry
+};
+```
+
+During evacuation:
+1. Entry is copied to new location
+2. Handle locations in heap objects must be updated atomically
+3. **Race window**: Between copy and handle update, two entries reference the
+   same external pointer
+4. If the old entry is freed before all handles are updated → dangling handle
+
+**Severity**: MEDIUM (requires precise GC timing, but could lead to
+use-after-free on pointer table entries)
+
+### Vector 20: Hardware Sandbox Strict vs Non-Strict Mode
+
+**Location**: `src/sandbox/hardware-support.h:46-165`
+
+The hardware sandbox uses three Memory Protection Keys (PKEYs):
+- `sandbox_pkey_` — For writable in-sandbox memory
+- `out_of_sandbox_pkey_` — For out-of-sandbox memory (opt-in tracking)
+- `extension_pkey_` — For out-of-sandbox memory still writable to sandboxed code
+
+**Non-strict mode** (default) does NOT remove write access to all out-of-sandbox
+memory — only memory explicitly tagged with `out_of_sandbox_pkey_`. Memory not
+tagged with any PKEY remains writable. This means:
+- Newly allocated memory outside the sandbox is writable by default
+- Only memory explicitly registered with `RegisterOutOfSandboxMemory()` gets protection
+- Attack: Target untagged out-of-sandbox memory that was never registered
+
+**Strict mode** removes all write access to anything without `sandbox_pkey_`
+or `extension_pkey_`, but has compatibility issues (line 46 comment).
+
+Additionally, kernel signal delivery support check at line 123
+(`crbug.com/429173713`) suggests signal handlers may bypass PKU protections.
+
+### Vector 21: JSDispatchTable Compact Encoding Abuse
+
+**Location**: `src/sandbox/js-dispatch-table-inl.h:122-130`
+
+On 64-bit, JSDispatchTable entries encode three fields in a single word:
+```
+[pointer (bits 17-63)] [marking_bit (bit 16)] [parameter_count (bits 0-15)]
+```
+
+If an attacker can write to this word (requires bypassing write protection):
+1. Modifying the parameter count (bits 0-15) causes stack mismatch
+2. Modifying the marking bit (bit 16) disrupts GC marking
+3. Modifying pointer bits (17-63) redirects code execution
+4. A single corrupted word affects ALL THREE fields simultaneously
+
+### Vector 22: Memory Corruption API Safe Crash Filtering
+
+**Location**: `src/sandbox/testing.cc:703-1048`
+
+The sandbox testing mode registers "safe" crash regions and filters specific
+crash types. When testing mode is active:
+
+| Address Range | Classification | Filter Reason |
+|---------------|---------------|---------------|
+| Pointer table memory | Safe | Lines 768-776 |
+| Non-canonical addresses | Safe | Lines 914-923 |
+| Kernel space addresses | Safe | Lines 925-932 |
+| Nullptr (first page) | Safe | Lines 935-941 |
+| First 4GB | Safe | Lines 945-953 (crbug.com/1470641) |
+
+**Risk**: During security testing with the Memory Corruption API enabled,
+crashes in these "safe" regions are silently filtered. An attacker exploiting
+a pointer table corruption bug would have their crashes masked as "safe",
+preventing detection.
+
+Specific primitives exposed via the Memory Corruption API:
+- `Sandbox.getAddressOf(Object)` — Get heap object address
+- `Sandbox.getObjectAt(Address)` — Read object from arbitrary address
+- `Sandbox.corruptObjectField(obj, offset, value)` — Direct field corruption
+- `Sandbox.setFunctionCodeToBuiltin(func, id)` — Change function code
+- `new Sandbox.MemoryView(offset, size)` — Raw sandbox memory access
+
 ## Recommended Mitigations
 
 1. **Remove `kFallbackToPartiallyReservedSandboxAllowed`**: Crash instead of
@@ -568,3 +708,13 @@ For a partially reserved sandbox where `reservation_size_ < size_`:
 | `sandbox/code-pointer-table-inl.h` | 62-81 | **Freelist tag exploitation (CPT)** |
 | `sandbox/bytecode-verifier.cc` | 208-219 | **Missing operand validation (11 types)** |
 | `sandbox/GLOSSARY.md` | 106-107 | EPT swap attack documentation |
+| `sandbox/external-entity-table-inl.h` | 259-288 | **Freelist CAS ABA race (Vector 17)** |
+| `sandbox/trusted-pointer-table-inl.h` | 139-150 | **Entry re-publishing attack (Vector 18)** |
+| `sandbox/trusted-pointer-table.h` | 58 | `kUnpublishedIndirectPointerTag` |
+| `sandbox/external-pointer-table.h` | 230-235 | **Entry evacuation/compaction race (Vector 19)** |
+| `sandbox/hardware-support.h` | 46 | **Strict vs non-strict mode (Vector 20)** |
+| `sandbox/hardware-support.h` | 149-165 | Three PKEY allocation |
+| `sandbox/js-dispatch-table-inl.h` | 122-130 | **Compact encoding abuse (Vector 21)** |
+| `sandbox/testing.cc` | 703-1048 | **Safe crash filtering (Vector 22)** |
+| `sandbox/testing.cc` | 85-125 | `Sandbox.MemoryView` raw access |
+| `sandbox/testing.cc` | 510-562 | `corruptObjectField()` |

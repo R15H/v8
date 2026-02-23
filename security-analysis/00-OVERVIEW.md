@@ -84,7 +84,7 @@ LOW ─────────────────────────�
 | [poc-vuln001-analysis.md](poc-vuln001-analysis.md) | VULN-001 complete call chain, PoC, and exploitation analysis |
 | [deep-dive-vuln002-allow-invalid-inputs.md](deep-dive-vuln002-allow-invalid-inputs.md) | VULN-002: 40+ InputIs() call sites, 30+ unimplemented ops |
 | [deep-dive-vuln003-checkbounds-precision.md](deep-dive-vuln003-checkbounds-precision.md) | VULN-003: Bounds check elimination chain analysis |
-| [deep-dive-vuln004-sandbox-bypass.md](deep-dive-vuln004-sandbox-bypass.md) | VULN-004: 8 sandbox bypass vectors with pointer table analysis |
+| [deep-dive-vuln004-sandbox-bypass.md](deep-dive-vuln004-sandbox-bypass.md) | VULN-004: 22 sandbox bypass vectors with pointer table analysis |
 | [deep-dive-vuln005-007-additional-patterns.md](deep-dive-vuln005-007-additional-patterns.md) | VULN-005/007: FatalNoSecurityImpact + write barriers + RegExp |
 | [deep-dive-vuln006-runtime-hardening.md](deep-dive-vuln006-runtime-hardening.md) | VULN-006: Runtime SBXCHECK coverage gap (1/671 functions) |
 
