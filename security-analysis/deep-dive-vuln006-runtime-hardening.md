@@ -266,6 +266,47 @@ to allocate an incorrect size.
 Similarly, `Runtime_ArrayIncludes_Slow` at line 241 trusts `object->map()->instance_type()`
 to determine whether to treat the object as a JSArray, enabling type confusion.
 
+## Critical Finding: Prototype Chain Functions Lack Recursion Limits
+
+### Location: `src/runtime/runtime-object.cc:445-595`
+
+Multiple runtime functions traverse prototype chains without cycle detection
+or recursion depth limits:
+
+| Function | Line | Issue |
+|----------|------|-------|
+| `Runtime_InternalSetPrototype` | 445-454 | `SetPrototype()` no cycle protection |
+| `Runtime_JSReceiverGetPrototypeOf` | 561-568 | `GetPrototype()` no recursion limit |
+| `Runtime_JSReceiverSetPrototypeOfThrow` | 570-582 | Same as InternalSetPrototype |
+| `Runtime_JSReceiverSetPrototypeOfDontThrow` | 584-595 | Same |
+| `Runtime_GetProperty` | 597-715 | 715 lines; deep property walks trust corrupted maps |
+
+**Attack**: If an attacker corrupts prototype pointers to create a cycle
+(`A.__proto__ → B`, `B.__proto__ → A`), any prototype chain traversal becomes
+an infinite loop → stack overflow → DoS or potentially exploitable crash.
+
+Additionally, `Runtime_GetProperty` (715 lines) trusts `object->map()` for
+dictionary lookups. A corrupted `map->property_dictionary()` pointer causes
+reads from attacker-controlled memory during property lookup.
+
+## Critical Finding: Property Enumeration Trusts Descriptor Tables
+
+### Location: `src/runtime/runtime-object.cc:88-510`
+
+Property enumeration functions trust the object's map and descriptor arrays:
+
+| Function | Line | Trusts |
+|----------|------|--------|
+| `Runtime_ObjectKeys` | 88-105 | `map->descriptor_array()` |
+| `Runtime_ObjectGetOwnPropertyNames` | 108-127 | `map->descriptor_array()` |
+| `Runtime_ObjectValues` | 470-482 | Map for property enumeration |
+| `Runtime_ObjectEntries` | 498-510 | Map for keys + values |
+
+All use `KeyAccumulator::GetKeys()` which iterates the object's descriptor
+table. If `map->descriptor_array()` is corrupted to point to attacker-controlled
+memory, the enumeration reads garbage as property descriptors → information
+disclosure or type confusion.
+
 ## Hardening Commit Analysis: a03a1a3c
 
 ### What Was Fixed
