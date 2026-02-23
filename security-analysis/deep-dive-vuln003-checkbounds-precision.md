@@ -10,7 +10,12 @@ precision due to double-precision floating-point limitations. Additionally, the
 multi-phase bounds check elimination process involves multiple code paths where
 type information drives check removal decisions.
 
-## Severity: HIGH (Bounds Check Elimination Chain)
+## Severity: LOW (Precision Loss) / HIGH (BCE Chain with Upstream Bug)
+
+**Revised after deep investigation**: The precision loss at `length.Max() - 1` is
+constrained by type cache limits. With sandbox: max 32GB-1 (safe). Without sandbox
+on 64-bit: max 2^53-1 (exact in IEEE 754). The real severity comes from the bounds
+check elimination chain being exploitable with an upstream typer bug.
 
 ## Key Code Paths
 
@@ -138,6 +143,117 @@ If the type says "not a hole", the hole check is completely eliminated. If the
 type was wrong (e.g., due to an upstream typer bug like VULN-001), a hole value
 can flow through unchecked.
 
+## New Finding: 64-Bit Bounds Check Path for TypedArrays
+
+### kMaxByteLength: Sandbox vs Non-Sandbox
+
+From `src/objects/js-array-buffer.h:33-39`:
+
+```cpp
+#if V8_ENABLE_SANDBOX
+  static constexpr size_t kMaxByteLength = kMaxSafeBufferSizeForSandbox;
+#elif V8_HOST_ARCH_32_BIT
+  static constexpr size_t kMaxByteLength = kMaxInt;
+#else
+  static constexpr size_t kMaxByteLength = kMaxSafeInteger;  // 2^53 - 1
+#endif
+```
+
+From `include/v8-internal.h:283`:
+```cpp
+constexpr size_t kMaxSafeBufferSizeForSandbox = 32ULL * GB - 1;  // ~34 billion
+```
+
+| Config | kMaxByteLength | Safe Integer? | Precision Loss? |
+|--------|---------------|---------------|-----------------|
+| Sandbox enabled | 32GB - 1 (~3.4×10^10) | Yes (well within 2^53) | No |
+| 32-bit host | kMaxInt (~2.1×10^9) | Yes | No |
+| **64-bit, no sandbox** | **2^53 - 1** | **Exactly at boundary** | **No (2^53-1 is exact)** |
+
+**Key insight**: Even on 64-bit without sandbox, `kMaxSafeInteger = 2^53 - 1` is
+exactly representable in IEEE 754 double, and `(2^53 - 1) - 1 = 2^53 - 2` is also
+exact. So there is NO precision loss with the defined maximums. The vulnerability
+would require a code path that produces a length type EXCEEDING `kMaxSafeInteger`.
+
+### kAllow64BitBounds Flag for TypedArrays
+
+TypedArray accesses use a special `kAllow64BitBounds` flag that enables 64-bit
+bounds checking in `SimplifiedLowering`.
+
+From `src/compiler/js-native-context-specialization.cc:4000-4004`:
+```cpp
+index = effect = graph()->NewNode(
+    simplified()->CheckBounds(FeedbackSource(),
+                              CheckBoundsFlag::kConvertStringAndMinusZero |
+                                  CheckBoundsFlag::kAllow64BitBounds),
+    index, length, effect, control);
+```
+
+This flag routes through the 64-bit path in `simplified-lowering.cc:2087-2100`:
+```cpp
+} else {
+  CHECK(length_type.Is(type_cache_->kPositiveSafeInteger));
+  CHECK(allow_64_bit);
+  // ... converts to CheckedUint64Bounds
+  ChangeOp(node, simplified()->CheckedUint64Bounds(feedback, new_flags));
+}
+```
+
+### Complete Bounds Check Elimination Logic
+
+From `src/compiler/simplified-lowering.cc:2034-2045`:
+```cpp
+if (lower<T>()) {
+  if (index_type.IsNone() || length_type.IsNone() ||
+      (index_type.Min() >= 0.0 &&
+       index_type.Max() < length_type.Min())) {
+    // The bounds check is redundant
+    if (v8_flags.turbo_typer_hardening) {
+      new_flags |= CheckBoundsFlag::kAbortOnOutOfBounds;  // Keep check, but abort-style
+    } else {
+      DeferReplacement(node, NodeProperties::GetValueInput(node, 0));  // COMPLETELY REMOVES CHECK
+      return;
+    }
+  }
+  ChangeOp(node, simplified()->CheckedUint32Bounds(feedback, new_flags));
+}
+```
+
+The check is eliminated when `index_type.Max() < length_type.Min()`. If
+`--turbo-typer-hardening` is enabled (default: true), the check is kept but
+converted to an abort-on-failure style. If disabled, the check is completely
+removed via `DeferReplacement`.
+
+### Memory Lowering: From Checked to Raw Access
+
+After bounds check elimination, `memory-lowering.cc:393-402` converts the
+high-level `LoadElement` to a raw machine `Load`:
+
+```cpp
+Reduction MemoryLowering::ReduceLoadElement(Node* node) {
+  ElementAccess const& access = ElementAccessOf(node->op());
+  Node* index = node->InputAt(1);
+  node->ReplaceInput(1, ComputeIndex(access, index));  // Raw offset
+  NodeProperties::ChangeOp(node, machine()->Load(type));  // Unchecked load
+  return Changed(node);
+}
+```
+
+### All Callers of CheckBounds
+
+The `CheckBounds` operator is created at 20+ sites across the compiler:
+
+| File | Key Lines | Context |
+|------|-----------|---------|
+| `js-call-reducer.cc` | 817, 6261, 6476, 6891, 7041, 7253, 7443, 8719, 8743 | Array method inlining |
+| `js-native-context-specialization.cc` | 3501, 3507, 3562, 3688, 3797, 4001, 4029, 4033, 4112, 4178, 4197, 4217 | Property access, TypedArray access |
+| `js-create-lowering.cc` | 495 | Object construction |
+| `js-typed-lowering.cc` | 658 | Typed lowering |
+| `typed-optimization.cc` | 192, 215 | Type-based optimization |
+
+The TypedArray paths at `js-native-context-specialization.cc:4001-4033` are the
+most interesting because they use `kAllow64BitBounds`.
+
 ## Exploitation Scenarios
 
 ### Scenario 1: DCHECK Bypass for Precision Loss
@@ -235,15 +351,24 @@ The bounds check would NOT be eliminated for an Any() index.
 1. **Type cache constraints**: Array length types are well-defined and within
    safe integer range, preventing precision loss in `CheckBounds`.
 
-2. **Multi-layer checking**: Bounds checks go through multiple phases
+2. **`--turbo-typer-hardening` (default: true)**: When enabled, bounds checks
+   that could be eliminated are instead converted to abort-on-failure checks
+   (`kAbortOnOutOfBounds`). This means even if types say the check is redundant,
+   a runtime check still exists. This is the **primary mitigation** against
+   type-system-driven BCE attacks.
+
+3. **Multi-layer checking**: Bounds checks go through multiple phases
    (TypedOptimization → SimplifiedLowering), each independently verifying
    type consistency.
 
-3. **Deoptimization guards**: Speculative optimizations include deoptimization
+4. **Deoptimization guards**: Speculative optimizations include deoptimization
    checks that trigger if runtime values don't match expected types.
 
-4. **DCHECK as safety net**: While disabled in release, DCHECKs catch
+5. **DCHECK as safety net**: While disabled in release, DCHECKs catch
    violations during development and testing.
+
+6. **Sandbox buffer size limit**: With sandbox enabled, `kMaxByteLength` is
+   capped at 32GB-1, well within safe integer range for precision.
 
 ## Verdict
 
@@ -264,10 +389,17 @@ check elimination logic itself.
 | `typed-optimization.cc` | 223-231 | `ReduceCheckNotTaggedHole()` |
 | `simplified-lowering.cc` | 63-84 | Three-phase PROPAGATE/RETYPE/LOWER |
 | `simplified-lowering.cc` | 216-242 | `CanOverflowSigned32()` |
+| `simplified-lowering.cc` | 2034-2045 | **Bounds check elimination decision** |
+| `simplified-lowering.cc` | 2087-2100 | **64-bit bounds check path (TypedArrays)** |
+| `js-native-context-specialization.cc` | 4001-4004 | **kAllow64BitBounds for TypedArrays** |
+| `memory-lowering.cc` | 393-402 | **Conversion to raw machine loads** |
 | `type-cache.h` | 86-93 | `kSafeInteger`, `kPositiveSafeInteger` |
 | `type-cache.h` | 97 | `kFixedArrayLengthType` |
 | `type-cache.h` | 110 | `kJSArrayLengthType` |
 | `type-cache.h` | 128-129 | `kJSTypedArrayLengthType` |
+| `js-array-buffer.h` | 33-39 | `kMaxByteLength` (sandbox vs non-sandbox) |
+| `v8-internal.h` | 283 | `kMaxSafeBufferSizeForSandbox = 32GB - 1` |
+| `flag-definitions.h` | 1646 | `--turbo-typer-hardening` (default: true) |
 
 ## Similar Past CVEs
 
