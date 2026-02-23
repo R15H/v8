@@ -48,31 +48,45 @@ From the header comment:
 
 ### Call Sites Analysis
 
-Found **20+ call sites** of `FatalNoSecurityImpact` in the codebase:
+Found **18+ call sites** of `FatalNoSecurityImpact` in the codebase, organized by function:
 
-#### Factory Allocation (`src/heap/factory-base.cc`)
-```
-Line 240:  FatalNoSecurityImpact("Invalid FixedArray size %d", length);
-Line 337:  FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 1191: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 1357: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 1368: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 1418: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-```
+#### Factory Allocation (`src/heap/factory-base.cc`) — 6 sites
 
-#### FixedArray Access (`src/objects/fixed-array-inl.h`)
-```
-Line 314: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 337: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 366: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 388: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 567: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 584: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 726: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 742: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 842: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-Line 882: FatalNoSecurityImpact("Fatal JavaScript invalid size error %d", ...);
-```
+| Line | Function | Condition | Max Length |
+|------|----------|-----------|------------|
+| 240 | `FixedArray::New()` | `length > FixedArray::kMaxLength` | ~2^30-1 |
+| 337 | `NewBytecodeArray()` | `length < 0 \|\| length > BytecodeArray::kMaxLength` | Negative + max |
+| 1191 | `NewBigInt()` | `length > BigInt::kMaxLength` | BigInt digit limit |
+| 1357 | `AllocateRawFixedArray()` | `length < 0 \|\| length > FixedArray::kMaxLength` | Low-level allocation |
+| 1368 | `AllocateRawWeakArrayList()` | `capacity < 0 \|\| capacity > WeakArrayList::kMaxCapacity` | Weak array |
+| 1418 | `AllocateSwissNameDictionary()` | `capacity < 0 \|\| capacity > SwissNameDictionary::MaxCapacity()` | Dictionary |
+
+#### FixedArray Inline Allocation (`src/objects/fixed-array-inl.h`) — 10 sites (crbug.com/1201626)
+
+| Line | Function | Type |
+|------|----------|------|
+| 314 | `FixedArray::New()` (basic) | `FixedArrayBase::kMaxLength` |
+| 337 | `FixedArray::New()` (with callback) | `FixedArrayBase::kMaxLength` |
+| 366 | `TrustedFixedArray::New()` | `TrustedFixedArray::kMaxLength` |
+| 388 | `ProtectedFixedArray::New()` | `ProtectedFixedArray::kMaxLength` |
+| 567 | `FixedDoubleArray::New()` (basic) | `kMaxLength` |
+| 584 | `FixedDoubleArray::New()` (with callback) | `kMaxLength` |
+| 726 | `TrustedWeakFixedArray::New()` | `TrustedFixedArray::kMaxLength` |
+| 742 | `ProtectedWeakFixedArray::New()` | `TrustedFixedArray::kMaxLength` |
+| 842 | `ByteArray::New()` | `kMaxLength` (signed-to-unsigned cast) |
+| 882 | `TrustedByteArray::New()` | `kMaxLength` (signed-to-unsigned cast) |
+
+All 10 reference `crbug.com/1201626` — a known issue where these paths were
+determined to have "no security impact." Note the `ByteArray::New()` sites at
+lines 842/882 use `static_cast<unsigned>(length) > kMaxLength`, which means a
+negative signed `length` becomes a very large unsigned value, correctly rejected.
+
+#### Other Sites
+
+| File | Line | Context | Severity |
+|------|------|---------|----------|
+| `flag-definitions.h` | 77 | `DEFINE_REQUIREMENT` macro for flag validation | LOW (startup only) |
+| `heap.cc` | 5064 | `ConfigureHeap()` flag consistency | LOW (startup only) |
 
 ### Security Concern
 
@@ -124,11 +138,100 @@ is recursive visitors over deeply nested regexp ASTs.
 ### Key Files
 
 ```
-src/regexp/regexp-compiler.cc   - RegExp compilation
-src/regexp/regexp-interpreter.cc - RegExp interpretation
+src/regexp/regexp-compiler.cc   - RegExp compilation (recursion enforcement)
+src/regexp/regexp-compiler.h    - Recursion limit definitions
+src/regexp/regexp-interpreter.cc - Backtrack stack with SBXCHECK
 src/regexp/regexp-parser.cc     - RegExp parsing
 src/regexp/regexp-ast.h         - AST node definitions (recursive structure)
 ```
+
+### Recursion Limit Mechanism
+
+**Definition** (`regexp-compiler.h:587-594`):
+```cpp
+#if defined(V8_TARGET_OS_MACOS)
+  static constexpr int kMaxRecursion = 50;   // macOS: 512kB stack
+#else
+  static constexpr int kMaxRecursion = 100;  // Others: 8MB stack
+#endif
+```
+Reference: `crbug.com/408820921`
+
+**Tracking** (`regexp-compiler.h:595-597`):
+```cpp
+inline int recursion_depth() { return recursion_depth_; }
+inline void IncrementRecursionDepth() { recursion_depth_++; }
+inline void DecrementRecursionDepth() { recursion_depth_--; }
+```
+
+**Enforcement Point 1** (`regexp-compiler.cc:1521-1524`):
+```cpp
+bool RegExpNode::KeepRecursing(RegExpCompiler* compiler) {
+  return !compiler->limiting_recursion() &&
+         compiler->recursion_depth() <= RegExpCompiler::kMaxRecursion;
+}
+```
+
+**Enforcement Point 2** (`regexp-compiler.cc:2583-2586`) — loop length analysis:
+```cpp
+int recursion_depth = 0;
+while (node != this) {
+  if (recursion_depth++ > RegExpCompiler::kMaxRecursion) {
+    return kNodeIsTooComplexForFixedLengthLoops;
+  }
+```
+
+### Stack Overflow Check — "Super Hacky"
+
+`regexp-compiler.h:621-630`:
+```cpp
+// The recursive nature of ToNode node generation means we may run into stack
+// overflow issues. We introduce periodic checks to detect these, and the
+// tick counter helps limit overhead of these checks.
+// TODO(jgruber): This is super hacky and should be replaced by an abort
+// mechanism or iterative node generation.
+void ToNodeMaybeCheckForStackOverflow() {
+  if ((to_node_overflow_check_ticks_++ % 64 == 0)) {
+    ToNodeCheckForStackOverflow();
+  }
+}
+```
+
+**Concern**: The check only runs every 64 calls. If a deeply nested pattern
+causes >64 levels of recursion between checks, the stack could overflow before
+detection. The `% 64` interval means up to 63 recursive calls happen unchecked.
+
+### Backtracking Stack Protection
+
+`regexp-interpreter.cc:126-150`:
+```cpp
+class BacktrackStack {
+  V8_WARN_UNUSED_RESULT bool push(int v) {
+    data_.emplace_back(v);
+    return (static_cast<int>(data_.size()) <= kMaxSize);
+  }
+  int peek() const {
+    SBXCHECK(!data_.empty());  // Sandbox-hardened check
+    return data_.back();
+  }
+```
+
+The `SBXCHECK` on `peek()` is a sandbox-hardened check (survives release builds),
+preventing underflow on the backtracking stack.
+
+### Additional RegExp Concerns
+
+**Experimental compiler** (`experimental-compiler.cc:480`):
+```cpp
+// TODO(v8:10765): Handle stack overflow instead of passing unlimited max
+```
+Experimental path has NO stack overflow handling.
+
+**Bytecode generator** (`regexp-bytecode-generator.cc:428,441`):
+```cpp
+// TODO(pthier): This is super hacky. We could still check for 4 characters
+```
+Multiple hacks acknowledged in bytecode generation.
 
 ### Attack Pattern
 
@@ -142,18 +245,12 @@ for (let i = 0; i < 100000; i++) {
 new RegExp(pattern);
 ```
 
-The AST visitor recursion depth is bounded by the nesting depth of the regex.
-V8 has stack depth checks, but:
-1. Check granularity matters - if checks are per-N-levels instead of per-level
-2. Platform stack sizes vary
-3. Stack guard checks may not be present in all visitor paths
-
 ### Impact
 
 - **Primary**: Denial of service (process crash via stack overflow)
-- **Theoretical**: If stack overflow corrupts return addresses or local
-  variables before being caught, could enable control flow hijacking. In
-  practice, modern systems have guard pages that make this extremely difficult.
+- **Mitigated by**: kMaxRecursion limits (50/100), periodic stack checks
+- **Gaps**: Stack check granularity (every 64 calls), experimental compiler
+  unlimited stack, platform-dependent stack sizes
 
 ---
 
@@ -258,6 +355,148 @@ Priority audit targets (tagged pointer stores with no obvious safety comment):
 
 ---
 
+## Additional Pattern: StoreNoWriteBarrier in Keyed Store Generic
+
+### Severity: LOW (Correct Usage) / AUDIT TARGET
+
+### Analysis (`src/ic/keyed-store-generic.cc`)
+
+9 specific `StoreNoWriteBarrier` call sites in keyed element store operations:
+
+| Line | Value Stored | Representation | Safety |
+|------|-------------|----------------|--------|
+| 468 | SMI value | `kTaggedSigned` | **SAFE** — SMIs never require write barriers |
+| 509 | `kUndefinedNanInt64` | `kWord64` | **SAFE** — Raw double bit pattern |
+| 514 | `kUndefinedNanLower32` | `kWord32` | **SAFE** — Raw bits |
+| 517 | `kUndefinedNanLower32` (upper) | `kWord32` | **SAFE** — Raw bits |
+| 545 | `double_value` | `kFloat64` | **SAFE** — Primitive double |
+| 611 | `double_value` | `kFloat64` | **SAFE** — Primitive for PACKED_DOUBLE_ELEMENTS |
+| 623 | `kUndefinedNanInt64` | `kWord64` | **SAFE** — Raw bit pattern |
+| 627 | `kUndefinedNanLower32` | `kWord32` | **SAFE** — Raw bits |
+| 629 | `kUndefinedNanLower32` (upper) | `kWord32` | **SAFE** — Raw bits |
+
+**Assessment**: All uses in keyed-store-generic are safe because:
+1. SMI values are verified via `TaggedIsSmi(value)` before store
+2. Double values are primitive bit patterns, not heap object references
+3. All paths verify element kind before selecting the store path
+
+**Residual Risk**: If element kind checking fails or gets corrupted (e.g., via
+sandbox memory corruption), what the code assumes is a double could actually
+store a tagged pointer without write barrier. However, element kind transitions
+are guarded by the type feedback system.
+
+---
+
+## Additional Pattern: UNREACHABLE() Elimination Assumptions
+
+### Severity: MEDIUM (Type Confusion Indicator)
+
+### Location: `src/compiler/js-generic-lowering.cc`
+
+21+ sites assume specific optimization phases eliminate operations before
+generic lowering. Each follows the pattern:
+
+```cpp
+void JSGenericLowering::LowerJSXxx(Node* node) {
+  UNREACHABLE();  // Eliminated in typed lowering.
+}
+```
+
+### Complete List
+
+| Line | Operation | Expected Eliminator |
+|------|-----------|-------------------|
+| 567 | `JSHasContextExtension` | Typed lowering |
+| 571 | `JSLoadContextNoCell` | Typed lowering |
+| 575 | `JSLoadContext` | Typed lowering |
+| 579 | `JSStoreContextNoCell` | Typed lowering |
+| 583 | `JSStoreContext` | Context specialization |
+| 633 | `JSCreateArrayIterator` | Typed lowering |
+| 637 | `JSCreateAsyncFunctionObject` | Typed lowering |
+| 641 | `JSCreateCollectionIterator` | Typed lowering |
+| 645 | `JSCreateBoundFunction` | Typed lowering |
+| 649 | `JSObjectIsArray` | Typed lowering |
+| 657 | `JSCreateStringWrapper` | Typed lowering |
+| 717+ | 10+ additional operations | Various phases |
+
+### Security Implications
+
+1. **Single point of failure**: If typed lowering fails to eliminate an operation,
+   `UNREACHABLE()` triggers an abort rather than a graceful fallback
+2. **Type confusion indicator**: A type confusion bug that prevents proper
+   elimination would trigger these crashes — useful as canary signals
+3. **Not defensive**: Unlike `CHECK()`, `UNREACHABLE()` provides no diagnostic
+   information about what went wrong or recovery path
+4. **Potential masking**: If reached via crafted input, the crash may not be
+   flagged as security-relevant by fuzzers (depends on crash classification)
+
+### Attack Relevance
+
+An attacker who can prevent the typed lowering phase from eliminating a specific
+operation (e.g., via malformed feedback data or type system confusion) could
+force execution to reach `UNREACHABLE()`. While this is "just" a crash, it
+indicates the compiler entered an invalid state, which may have other
+exploitable consequences before the crash occurs.
+
+---
+
+## Additional Pattern: Integer Overflow Protection
+
+### Severity: LOW (Well-Protected)
+
+### BigInt Addition Overflow (`src/objects/bigint.cc:1201-1211`)
+
+```cpp
+uint32_t result_length = input_length + will_overflow;  // will_overflow is 0 or 1
+```
+
+**Safe**: `BigInt::kMaxLength` is well below `UINT32_MAX`, so `+1` cannot wrap.
+
+### SignedMulOverflow32 Checks (`src/objects/fixed-array-inl.h`)
+
+5 allocation paths use `base::bits::SignedMulOverflow32()` to prevent
+`length * sizeof(T)` overflow:
+
+| Line | Function |
+|------|----------|
+| 928 | `FixedIntegerArrayBase` template |
+| 983 | `PodArray::New()` |
+| 993 | `PodArray::New()` (LocalIsolate) |
+| 1003 | `TrustedPodArray::New()` |
+| 1013 | `TrustedPodArray::New()` (LocalIsolate) |
+
+All use the same pattern:
+```cpp
+int byte_length;
+CHECK(!base::bits::SignedMulOverflow32(length, sizeof(T), &byte_length));
+```
+
+**Assessment**: Integer overflow detection is comprehensive for array allocation
+paths. The `CHECK` (not `DCHECK`) ensures this runs in release builds.
+
+---
+
+## Additional Pattern: Write Barrier Mode Caching
+
+### Severity: LOW (Theoretical)
+
+**Location**: `src/heap/factory-base.cc:440-446`
+
+```cpp
+WriteBarrierMode write_barrier_mode = allocation == AllocationType::kYoung
+                                          ? SKIP_WRITE_BARRIER
+                                          : UPDATE_WRITE_BARRIER;
+result->set_context(*context, write_barrier_mode);
+result->set_arguments(*arguments, write_barrier_mode);
+```
+
+Write barrier mode is determined at allocation time. For `kYoung` allocation,
+barriers are skipped. This is safe because young space objects are evacuated
+(copied) during scavenge, not promoted in place. The GC root set handles the
+newly allocated object correctly.
+
+---
+
 ## Additional Pattern: Concurrent Marking Write Barrier Races
 
 ### Mechanism
@@ -303,8 +542,14 @@ V8 documents specific cases where barriers can be skipped:
 
 | Pattern | Severity | Status | Action |
 |---------|----------|--------|--------|
-| FatalNoSecurityImpact | MEDIUM | Confirmed | Audit all 20+ call sites |
-| RegExp stack overflow | LOW | Known pattern | Stack guards in all visitors |
-| StoreNoWriteBarrier (CSA) | HIGH (if wrong) | Needs audit | 45 occurrences in CSA |
-| UnsafeStoreNoWriteBarrier | HIGH (if wrong) | Needs audit | 3+ explicit unsafe stores |
+| FatalNoSecurityImpact (factory) | MEDIUM | 6 sites confirmed | Audit sandbox-reachable paths |
+| FatalNoSecurityImpact (FixedArray) | MEDIUM | 10 sites, crbug.com/1201626 | Verify "no security impact" classification |
+| RegExp recursion limits | LOW | 50/100 limits enforced | Stack check granularity (every 64 calls) |
+| RegExp experimental compiler | LOW | No stack limits | Experimental-only, not production |
+| StoreNoWriteBarrier (CSA) | HIGH (if wrong) | 45 occurrences | Priority: lines 3649, 4138, 4207 |
+| StoreNoWriteBarrier (keyed-store) | LOW | 9 sites, all safe | SMI/double verified before store |
+| UnsafeStoreNoWriteBarrier | HIGH (if wrong) | 3+ explicit unsafe | Audit lines 4140, 4210, 5197 |
+| UNREACHABLE() elimination | MEDIUM | 21+ sites | Type confusion indicator/canary |
+| Integer overflow (array alloc) | LOW | 5 sites, well-protected | `SignedMulOverflow32` CHECK |
+| Write barrier mode caching | LOW | Theoretical only | Safe due to scavenge semantics |
 | Concurrent marking races | HIGH (if wrong) | Systemic risk | Barrier completeness audit |
