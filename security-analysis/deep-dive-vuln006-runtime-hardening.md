@@ -89,6 +89,79 @@ with a comment: "trusted space, this is not a SBXCHECK". This is actually
 a comment about a CHECK being sufficient rather than an SBXCHECK, since the
 data is in trusted space.
 
+## Critical Finding: 288 Unchecked Type Casts
+
+### The `args.at<Type>()` Pattern
+
+The most significant finding is that runtime functions receive arguments via
+`args.at<Type>(index)`, which performs an **unchecked downcast** in release
+builds.
+
+**Location**: `src/execution/arguments.h:99-102`
+
+```cpp
+template <class S>
+Handle<S> Arguments<T>::at(int index) const {
+  Handle<Object> obj = Handle<Object>(address_of_arg_at(index));
+  return Cast<S>(obj);  // No type validation in release builds!
+}
+```
+
+There is a single SBXCHECK at `arguments.h:79` for bounds checking:
+```cpp
+SBXCHECK_LE(static_cast<uint32_t>(index), static_cast<uint32_t>(length_));
+```
+
+This prevents out-of-bounds argument access, but does NOT validate that the
+fetched argument is actually the expected type.
+
+### Unchecked Cast Count by File
+
+| File | Unchecked `args.at<T>()` Casts |
+|------|-------------------------------|
+| `runtime-object.cc` | 61 |
+| `runtime-test.cc` | 45 |
+| `runtime-scopes.cc` | 39 |
+| `runtime-strings.cc` | 35 |
+| `runtime-regexp.cc` | 25 |
+| `runtime-compiler.cc` | 18 |
+| `runtime-classes.cc` | 17 |
+| Others | 48 |
+| **Total** | **288** |
+
+### Concrete Example
+
+From `runtime-array.cc:16-25`:
+
+```cpp
+RUNTIME_FUNCTION(Runtime_TransitionElementsKind) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(2, args.length());                         // Debug-only!
+  DirectHandle<JSObject> object = args.at<JSObject>(0); // Unchecked cast
+  DirectHandle<Map> to_map = args.at<Map>(1);           // Unchecked cast
+  ElementsKind to_kind = to_map->elements_kind();
+  ElementsAccessor::ForKind(to_kind)->TransitionElementsKind(
+      isolate, object, to_map);
+  return *object;
+}
+```
+
+If argument 0 is not actually a JSObject (corrupted in sandbox), or argument 1
+is not a Map, no validation catches it. The DCHECK on argument count is stripped
+in release builds. The `Cast<Map>` call proceeds silently with corrupted data.
+
+### Security Implication
+
+Every one of these 288 cast sites is a potential type confusion primitive for an
+attacker with arbitrary sandbox R/W. By corrupting the arguments passed to a
+runtime function (either by corrupting the stack frame or the objects on the
+heap), an attacker can:
+
+1. Make `args.at<Map>(1)` return a corrupted object treated as a Map
+2. The runtime function reads Map fields from attacker-controlled memory
+3. Element kind, instance type, instance size are all under attacker control
+4. This enables arbitrary element kind transitions, size changes, etc.
+
 ## Evidence of Known Gaps
 
 ### Recent Hardening Commit
@@ -170,22 +243,37 @@ After achieving arbitrary R/W inside the sandbox (via JIT bug):
 7. **Type-safe runtime wrappers**: Create wrapper types that enforce validation
    on construction, so runtime functions can't accidentally skip checks
 
+## Quantitative Summary
+
+| Metric | Count |
+|--------|-------|
+| Total runtime source files | 33 |
+| Total RUNTIME_FUNCTION definitions | 671 |
+| Runtime files with any SBXCHECK | 1 (runtime-regexp.cc, commenting on its absence) |
+| Total `args.at<Type>()` unchecked casts | 288 |
+| DCHECK-only validation (stripped in release) | ~200+ |
+| Runtime CHECK validation (retained in release) | ~66 |
+| Security-related TODOs in runtime | 0 |
+
 ## Key File References
 
-| File | RUNTIME_FUNCTIONs | SBXCHECKs | Priority |
-|------|-------------------|-----------|----------|
-| `runtime-object.cc` | 74 | 0 | HIGH |
-| `runtime-wasm.cc` | 70 | 0 | MEDIUM |
-| `runtime-internal.cc` | 64 | 0 | HIGH |
-| `runtime-scopes.cc` | 30 | 0 | MEDIUM |
-| `runtime-strings.cc` | 23 | 0 | HIGH |
-| `runtime-atomics.cc` | 22 | 0 | MEDIUM |
-| `runtime-compiler.cc` | 21 | 0 | MEDIUM |
-| `runtime-promise.cc` | 15 | 0 | LOW |
-| `runtime-regexp.cc` | 12 | 1 | LOW (partially done) |
-| `runtime-array.cc` | 10 | 0 | HIGH |
-| `runtime-typedarray.cc` | 8 | 0 | HIGH |
-| Total | 671 | 1 | -- |
+| File | RUNTIME_FUNCTIONs | SBXCHECKs | Unchecked Casts | Priority |
+|------|-------------------|-----------|-----------------|----------|
+| `runtime-object.cc` | 74 | 0 | 61 | HIGH |
+| `runtime-wasm.cc` | 70 | 0 | - | MEDIUM |
+| `runtime-internal.cc` | 64 | 0 | - | HIGH |
+| `runtime-scopes.cc` | 30 | 0 | 39 | MEDIUM |
+| `runtime-strings.cc` | 23 | 0 | 35 | HIGH |
+| `runtime-atomics.cc` | 22 | 0 | - | MEDIUM |
+| `runtime-compiler.cc` | 21 | 0 | 18 | MEDIUM |
+| `runtime-promise.cc` | 15 | 0 | - | LOW |
+| `runtime-regexp.cc` | 12 | 0* | 25 | LOW |
+| `runtime-array.cc` | 10 | 0 | - | HIGH |
+| `runtime-typedarray.cc` | 8 | 0 | - | HIGH |
+| Total | 671 | 1** | 288 | -- |
+
+\* runtime-regexp.cc has a comment about SBXCHECK not being needed (trusted space)
+\*\* The single SBXCHECK is in arguments.h for bounds checking argument index
 
 ## Related CVEs
 

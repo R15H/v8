@@ -313,6 +313,110 @@ Step 6: Full compromise
   - With code execution outside sandbox → arbitrary system access
 ```
 
+## Additional Findings (From Deep Static Analysis)
+
+### Vector 9: Bytecode Verifier Incomplete Blocklist
+
+**Location**: `src/sandbox/bytecode-verifier.cc:254-269`
+
+```cpp
+// static
+bool BytecodeVerifier::IsAllowedRuntimeFunction(Runtime::FunctionId id) {
+  // This is currently purely for fuzzer-cleanliness and so we only add
+  // functions to this blocklist if we see them cause crashes during fuzzing.
+  switch (id) {
+#if V8_ENABLE_WEBASSEMBLY
+    case Runtime::kWasmTriggerTierUp:
+      return false;
+#endif
+    default:
+      return true;  // ALL OTHER RUNTIME FUNCTIONS ALLOWED
+  }
+}
+```
+
+Only **1 runtime function** (`kWasmTriggerTierUp`) is blocklisted. The comment
+explicitly states this is "purely for fuzzer-cleanliness" and not a thorough
+security audit. An attacker who can corrupt bytecode can call any of the other
+670+ runtime functions, many of which lack SBXCHECK protection (see VULN-006).
+
+Additionally, the lightweight verification (`VerifyLight()` at line 31) only
+validates jump targets, not:
+- Register access bounds
+- Constant pool bounds
+- Feedback slot validity
+
+### Vector 10: External Pointer Handle Bounds - Debug Only
+
+**Location**: `src/sandbox/external-pointer-table-inl.h:315-337`
+
+```cpp
+// Line 315-318: Format check only
+bool ExternalPointerTable::IsValidHandle(ExternalPointerHandle handle) {
+  uint32_t index = handle >> kExternalPointerIndexShift;
+  return handle == index << kExternalPointerIndexShift;  // Only format!
+}
+
+// Line 321-337: Bounds check is DCHECK only
+uint32_t ExternalPointerTable::HandleToIndex(ExternalPointerHandle handle) {
+  DCHECK(IsValidHandle(handle));
+  uint32_t index = handle >> kExternalPointerIndexShift;
+  DCHECK_LE(index, kMaxExternalPointers);  // DEBUG ONLY!
+  return index;
+}
+```
+
+In release builds, an attacker can craft a handle with valid format that
+points past the end of the external pointer table. The `at(index)` call
+at line 179 would then access out-of-bounds memory.
+
+### Vector 11: Pointer Table Memory Ordering Issues
+
+Multiple pointer tables use `std::memory_order_relaxed` for operations that
+need stronger guarantees:
+
+**ExternalPointerTable** (`external-pointer-table-inl.h`):
+```cpp
+// Line 175-179: Get() uses relaxed load
+Address ExternalPointerTable::Get(...) const {
+  uint32_t index = HandleToIndex(handle);
+  DCHECK(index == 0 || at(index).HasExternalPointer(tag_range));  // Relaxed
+  return at(index).GetExternalPointer(tag_range);  // Can race with Set()
+}
+```
+
+**JSDispatchTable** (`js-dispatch-table-inl.h`):
+```cpp
+// Line 103-114: SBXCHECK races with SetCodeAndEntrypointPointer
+void JSDispatchTable::SetCodeAndEntrypointNoWriteBarrier(...) {
+  SBXCHECK(IsCompatibleCode(new_code, GetParameterCount(handle)));  // T0
+  // Parameter count can be corrupted between T0 and T1 by attacker
+  uint32_t index = HandleToIndex(handle);
+  at(index).SetCodeAndEntrypointPointer(new_code.ptr(), new_entrypoint);  // T1
+}
+```
+
+The SBXCHECK at line 105 reads the parameter count, validates it, but the
+actual write operation at line 113 re-reads state that could have been
+corrupted in between. However, the JSDispatchTable is write-protected
+(`IsWriteProtected = true`), so this race requires bypassing write protection
+first.
+
+### Vector 12: LSan Entry Size Bypass
+
+**Location**: `src/sandbox/external-pointer-table-inl.h:326-333`
+
+```cpp
+// When LSan is active, we use "fat" entries that also store the raw pointer.
+// However, this is not secure as an attacker could reference the raw pointer
+// instead of the encoded pointer in an entry, thereby bypassing the type
+// checks. As such, this mode must only be used in testing environments.
+```
+
+If LSan is accidentally enabled in production, the external pointer table
+entries contain unencoded raw pointers alongside the tagged pointers,
+completely bypassing the type tag protection.
+
 ## Recommended Mitigations
 
 1. **Remove `kFallbackToPartiallyReservedSandboxAllowed`**: Crash instead of
@@ -338,10 +442,16 @@ Step 6: Full compromise
 | `sandbox/sandbox.h` | 72 | `kFallbackToPartiallyReservedSandboxAllowed` |
 | `sandbox/sandbox.h` | 113 | `is_partially_reserved()` |
 | `sandbox/sandbox.h` | 119-125 | Smi address range protection |
+| `sandbox/sandbox.cc` | 294-355 | `InitializeAsPartiallyReservedSandbox()` |
 | `sandbox/check.h` | 26-44 | SBXCHECK with DisallowSandboxAccess |
 | `sandbox/external-pointer-table.h` | 39-68 | EPT entry structure |
+| `sandbox/external-pointer-table-inl.h` | 175-180 | EPT Get() relaxed memory ordering |
+| `sandbox/external-pointer-table-inl.h` | 315-337 | Handle validation (format only + debug bounds) |
 | `sandbox/code-pointer-table.h` | 29-57 | CPT entry structure (write-protected) |
 | `sandbox/js-dispatch-table.h` | 31-46 | JDT entry structure (write-protected) |
+| `sandbox/js-dispatch-table-inl.h` | 103-114 | SBXCHECK + parameter count TOCTOU |
+| `sandbox/bytecode-verifier.cc` | 254-269 | `IsAllowedRuntimeFunction()` (1 blocklisted) |
+| `sandbox/bytecode-verifier.cc` | 31-82 | `VerifyLight()` (jump targets only) |
 | `sandbox/hardware-support.h` | 16-80 | MPK-based hardware protection |
 | `sandbox/testing.h` | 80-86 | Memory Corruption API |
 | `sandbox/GLOSSARY.md` | 106-107 | EPT swap attack documentation |
