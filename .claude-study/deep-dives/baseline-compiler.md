@@ -192,3 +192,17 @@ Sparkplug sits between Ignition and the optimizing compilers. Key interactions:
 | `src/baseline/baseline.h/.cc` | Entry points and utilities |
 | `src/baseline/bytecode-offset-iterator.h/.cc` | PC-to-bytecode mapping iteration |
 | `src/baseline/x64/baseline-assembler-x64-inl.h` | x64-specific code generation |
+
+## Implementation Details
+
+### Feedback Vector Integration
+
+Sparkplug code does not collect new feedback -- it reuses the same FeedbackVector that Ignition populates. Property accesses in Sparkplug code call IC builtins that read and update feedback slots just as they do during interpretation. This means Sparkplug code naturally keeps the feedback warm for Maglev and TurboFan.
+
+### Deoptimization Support
+
+Although Sparkplug does not speculate, it can be the target of deoptimization from Maglev or TurboFan. When an optimized function deoptimizes, the deoptimizer can reconstruct a Sparkplug frame using the bytecode offset table. This is possible because Sparkplug and Ignition share the same logical frame layout.
+
+### Code Flushing
+
+Sparkplug code can be flushed (discarded) during garbage collection if memory pressure is high. The function reverts to interpreter-only execution. This is controlled by the same mechanisms that flush bytecode and is important for memory-constrained environments like mobile devices.
