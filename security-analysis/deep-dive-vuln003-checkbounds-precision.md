@@ -239,20 +239,145 @@ Reduction MemoryLowering::ReduceLoadElement(Node* node) {
 }
 ```
 
-### All Callers of CheckBounds
+### CheckBoundsFlag Definitions
 
-The `CheckBounds` operator is created at 20+ sites across the compiler:
+From `src/compiler/simplified-operator.h`:
 
-| File | Key Lines | Context |
-|------|-----------|---------|
-| `js-call-reducer.cc` | 817, 6261, 6476, 6891, 7041, 7253, 7443, 8719, 8743 | Array method inlining |
-| `js-native-context-specialization.cc` | 3501, 3507, 3562, 3688, 3797, 4001, 4029, 4033, 4112, 4178, 4197, 4217 | Property access, TypedArray access |
-| `js-create-lowering.cc` | 495 | Object construction |
-| `js-typed-lowering.cc` | 658 | Typed lowering |
-| `typed-optimization.cc` | 192, 215 | Type-based optimization |
+```cpp
+enum class CheckBoundsFlag : uint8_t {
+  kConvertStringAndMinusZero = 1 << 0,  // Convert string/minus-zero to 0 instead of deopt
+  kAbortOnOutOfBounds = 1 << 1,         // Abort instead of deopt if input is OOB
+  kAllow64BitBounds = 1 << 2,           // Bounds may exceed 32-bit range (up to 64-bit safe integers)
+};
+```
 
-The TypedArray paths at `js-native-context-specialization.cc:4001-4033` are the
-most interesting because they use `kAllow64BitBounds`.
+### Complete Enumeration of All 26 CheckBounds Callers
+
+#### `js-call-reducer.cc` (9 callers)
+
+| # | Line | Context | Flags | Max Bound | Notes |
+|---|------|---------|-------|-----------|-------|
+| 1 | 817 | `JSCallReducerAssembler::CheckBounds()` helper | Varies | - | Helper used by multiple methods |
+| 2 | 6261 | `Array.prototype.pop()` | `kAbortOnOutOfBounds` | array.length | Only when `turbo_typer_hardening` |
+| 3 | 6476 | `Array.prototype.shift()` | `kAbortOnOutOfBounds` | array.length | Only when `turbo_typer_hardening` |
+| 4 | 6891 | for...of TypedArray iteration | `kAbortOnOutOfBounds\|kAllow64BitBounds` | 2^53-1 | **CRITICAL**: 64-bit TypedArray path |
+| 5 | 7041 | `String.prototype.charAt()` | None | string.length | Default flags |
+| 6 | 7253 | `String.fromCodePoint()` | `kConvertStringAndMinusZero` | 0x110000 | Unicode range check |
+| 7 | 7443 | `String.prototype.concat()` | None | `String::kMaxLength+1` | |
+| 8 | 8719 | DataView methods (fixed ArrayBuffer) | `kAllow64BitBounds` | buffer.byteLength | **CRITICAL**: 64-bit offset |
+| 9 | 8743 | DataView methods (dynamic ArrayBuffer) | `kAllow64BitBounds` | buffer.byteLength | **CRITICAL**: 64-bit offset |
+
+#### `js-native-context-specialization.cc` (12 callers)
+
+| # | Line | Context | Flags | Max Bound | Notes |
+|---|------|---------|-------|-----------|-------|
+| 10 | 3501 | Generic object element store | `kConvertStringAndMinusZero` | `Smi::kMaxValue` | |
+| 11 | 3507 | Generic object element load | `kConvertStringAndMinusZero` | object.length | |
+| 12 | 3562 | Object load with OOB→undefined | `kConvertStringAndMinusZero\|kAbortOnOutOfBounds` | object.length | Only when `turbo_typer_hardening` |
+| 13 | 3688 | Object element has() check | `kConvertStringAndMinusZero` | object.length | |
+| 14 | 3797 | JSArray store with growth | `kConvertStringAndMinusZero` | array.length+1 | May add 1 for growth |
+| 15 | 4001 | **TypedArray element load** | `kConvertStringAndMinusZero\|kAllow64BitBounds` | 2^53-1 | **PRIMARY EXPLOIT TARGET** |
+| 16 | 4029 | TypedArray load OOB (hardened) | `kConvertStringAndMinusZero\|kAbortOnOutOfBounds\|kAllow64BitBounds` | 2^53-1 | Only when `turbo_typer_hardening` |
+| 17 | 4112 | TypedArray store OOB (hardened) | `kConvertStringAndMinusZero\|kAbortOnOutOfBounds\|kAllow64BitBounds` | 2^53-1 | Only when `turbo_typer_hardening` |
+| 18 | 4178 | String character access (protector) | `kConvertStringAndMinusZero` | `String::kMaxLength` | |
+| 19 | 4197 | String access (hardened) | `kConvertStringAndMinusZero\|kAbortOnOutOfBounds` | string.length | Only when `turbo_typer_hardening` |
+| 20 | 4217 | String access (generic) | `kConvertStringAndMinusZero` | string.length | |
+
+#### Other files (4 callers)
+
+| # | File | Line | Context | Flags | Max Bound |
+|---|------|------|---------|-------|-----------|
+| 21 | `js-create-lowering.cc` | 495 | JSArray constructor | None | `kInitialMaxFastElementArray` |
+| 22 | `js-typed-lowering.cc` | 658 | String concat length | None | `String::kMaxLength+1` |
+| 23 | `typed-optimization.cc` | 192 | LoadElement optimization | `kAbortOnOutOfBounds` | array.length |
+| 24 | `typed-optimization.cc` | 215 | CheckBounds flag cleanup | None | - |
+
+### Flag Usage Summary by Caller Type
+
+| Caller Type | kConvertStringAndMinusZero | kAbortOnOutOfBounds | kAllow64BitBounds |
+|-------------|:-:|:-:|:-:|
+| String operations | Yes | No | No |
+| String operations (hardened) | Yes | Yes | No |
+| **TypedArray (main path)** | **Yes** | **No** | **Yes** |
+| **TypedArray (hardened)** | **Yes** | **Yes** | **Yes** |
+| **DataView** | **No** | **No** | **Yes** |
+| Array operations | No | Yes | No |
+| Generic objects | Yes | No | No |
+
+The TypedArray paths at `js-native-context-specialization.cc:4001-4033` and the
+DataView paths at `js-call-reducer.cc:8719-8745` are the most interesting because
+they use `kAllow64BitBounds`, routing through the 64-bit path in SimplifiedLowering.
+
+### Complete IR Operation Sequence (TypedArray Access)
+
+For a TypedArray access with length near 2^53-1, the full pipeline is:
+
+```
+1. TypedArrayLength(receiver) → Type::Range(0, 2^53-1)
+   Location: js-native-context-specialization.cc:3911
+
+2. CheckBounds(index, length)
+   Flags: kConvertStringAndMinusZero | kAllow64BitBounds
+   Location: js-native-context-specialization.cc:4001-4004
+
+3. OperationTyper::CheckBounds() type inference
+   Location: operation-typer.cc:1344-1353
+   Computes: upper_bound = Type::Range(0.0, length.Max() - 1, zone())
+   → With possible precision loss at line 1347
+
+4. Type narrowing via loop variable optimization or other inference
+
+5. SimplifiedLowering::VisitCheckBounds() elimination decision
+   Location: simplified-lowering.cc:2034-2045
+   If index_type.Max() < length_type.Min(): ELIMINATE VIA DeferReplacement()
+
+6. Memory lowering: LoadElement/StoreElement → raw machine ops
+   Location: memory-lowering.cc:393-402
+
+7. Raw unchecked memory load/store executes
+   → Out-of-bounds access possible if types were wrong
+```
+
+### turbo_typer_hardening Check Locations
+
+The `v8_flags.turbo_typer_hardening` flag (default: true, defined at
+`flag-definitions.h:1646`) is checked at 8 locations before inserting
+hardening bounds checks:
+
+| Location | Context |
+|----------|---------|
+| `simplified-lowering.cc:2040` | 32-bit bounds check elimination |
+| `js-native-context-specialization.cc:4027` | TypedArray load OOB |
+| `js-native-context-specialization.cc:4110` | TypedArray store OOB |
+| `js-native-context-specialization.cc:4195` | String character access |
+| `js-call-reducer.cc:6259` | `Array.prototype.pop()` |
+| `js-call-reducer.cc:6474` | `Array.prototype.shift()` |
+| `js-call-reducer.cc:6889` | for...of TypedArray iteration |
+| `typed-optimization.cc:190` | LoadElement optimization |
+
+When `turbo_typer_hardening` is disabled (`--no-turbo-typer-hardening`), ALL of
+these hardening checks are skipped, and bounds checks that appear redundant based
+on type information are completely eliminated. This flag is the single most
+important mitigation against type-system-driven BCE exploits.
+
+### turbo_loop_variable Interaction
+
+The `--turbo-loop-variable` flag (default: true, `flag-definitions.h:1632`)
+enables loop variable induction analysis that can narrow type ranges of loop
+indices. This is relevant because narrowed loop indices may cause bounds checks
+to appear redundant.
+
+Notable comment at `js-call-reducer.cc:6442-6448`:
+```cpp
+// When disable v8_flags.turbo_loop_variable, typer cannot infer index
+// is in [1, kMaxCopyElements-1], and will break in representing
+// kRepFloat64 (Range(1, inf)) to kRepWord64 when converting
+// input for kLoadElement. So we need to add type guard here.
+```
+
+This shows the tight coupling between loop variable optimization and bounds
+check elimination — incorrect loop variable typing can cascade into incorrect
+bounds check elimination.
 
 ## Exploitation Scenarios
 
